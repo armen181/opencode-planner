@@ -1,0 +1,41 @@
+{
+  "name": "@armen181/opencode-planner",
+  "version": "0.4.0",
+  "description": "Planner plugin for OpenCode 2: an opt-in planner agent that delegates to brainstormer/worker/tester subagents (and handles images via a vision subagent or proxy bridge), with per-agent model + effort configuration, TUI dialogs, and MCP servers disabled by default.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.ts"
+  },
+  "files": [
+    "src",
+    "agents-v2",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "multi-agent",
+    "planner",
+    "vision",
+    "subagents",
+    "orchestrator"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/armen181/opencode-planner.git"
+  },
+  "homepage": "https://github.com/armen181/opencode-planner#readme",
+  "bugs": {
+    "url": "https://github.com/armen181/opencode-planner/issues"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@opencode/plugin": "^2.0.24",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}

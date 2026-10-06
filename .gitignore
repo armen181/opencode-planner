@@ -1,0 +1,11 @@
+node_modules/
+__pycache__/
+*.pyc
+*.log
+.tmp/
+.DS_Store
+.idea/
+.commandcode/
+.opencode/
+*.tgz
+tests/e2e/longtest-*.json
