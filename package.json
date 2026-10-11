@@ -1,7 +1,7 @@
 {
   "name": "@armen181/opencode-planner",
-  "version": "0.4.0",
-  "description": "Planner plugin for OpenCode 2: an opt-in planner agent that delegates to brainstormer/worker/tester subagents (and handles images via a vision subagent or proxy bridge), with per-agent model + effort configuration, TUI dialogs, and MCP servers disabled by default.",
+  "version": "0.5.0",
+  "description": "Planner plugin for OpenCode 2: an opt-in planner agent that delegates to brainstormer/worker/tester subagents (and handles images via a vision subagent or proxy bridge), with a hard subagent concurrency cap, a mandatory-delegation watchdog, global defaults + per-project snapshots, version checks and one-click updates, TUI dialogs, and MCP servers disabled by default.",
   "license": "MIT",
   "type": "module",
   "exports": {
@@ -11,6 +11,7 @@
   "files": [
     "src",
     "agents-v2",
+    "extras",
     "install.sh",
     "README.md",
     "LICENSE"

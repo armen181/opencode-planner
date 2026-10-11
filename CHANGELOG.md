@@ -5,6 +5,194 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-10
+
+Hard enforcement where it used to be prompt-only, per-project config snapshots,
+and version/update awareness. Every feature was validated on a real OpenCode 2
+instance; each point has its own e2e suite.
+
+### Added
+
+- **The subagent concurrency cap (`maxParallelSubagents`) is now ENFORCED.**
+  The built-in `subagent` tool is wrapped with a semaphore: with 1, extra
+  calls wait for the running task instead of starting in parallel; with N, at
+  most N run at once. A permission-deny fallback covers builds where the tool
+  cannot be wrapped. Live config edits apply immediately (raising the cap wakes
+  queued calls). Scoped to planner-originated calls.
+- **Delegation watchdog (`enforceDelegation`, default on).** Every planner
+  turn must contain a COMPLETED subagent call: a turn that ends without one is
+  resumed with a bounded nudge (max 2 per user turn), and a READY brainstormer
+  spec that never reaches the worker/tester gets nudged too. The nudge is a
+  visible synthetic message that continues the turn. `planner.md` no longer
+  allows the planner to skip the brainstormer — only the brainstormer may
+  classify a request as TRIVIAL — and states "you are not a builder".
+- **Global defaults + per-project snapshots.** `planner-defaults.json` lives
+  in the opencode config dir (created on first load and by `install.sh`; never
+  overwritten), is editable by hand and through `/planner-config → Global
+  defaults (new projects)`. The first planner use in a project materializes a
+  full copy into `.opencode/planner-plugin.json` (atomic create-or-fail, with
+  `plannerVersion`/`createdAt`/`source` metadata). "Re-sync from defaults"
+  replaces a project's settings on demand. Effective config = project over
+  defaults over built-ins; `variants` are override-if-present.
+- **Version awareness + one-click update.** Project configs stamp
+  `plannerVersion`/`updatedAt`; agent definitions get a hash marker
+  (`.planner-agents.json`) so refreshes update files the plugin wrote and keep
+  user edits; a project-local plugin copy is detected. `/planner-status` (TUI
+  dialog + palette) lists running/install/config/agents/local-copy/latest
+  versions and conflicts, offers "Check for updates" (GitHub `package.json`,
+  cached 24 h, `PLANNER_NO_UPDATE_CHECK=1` disables the startup notice),
+  "Refresh agent definitions", and "Update now" — `git pull --ff-only` +
+  `install.sh --yes` from the `sourceRoot` recorded at install time, with a
+  confirmation step, a log file, and a restart notice. A failed pull aborts
+  instead of reinstalling a stale tree.
+- **Test coverage for every new point, verified on real instances:**
+  `test_semaphore_unit.py` (cap logic), `test_update_unit.py` (version
+  compare, status detection, agent refresh, update execution against fake
+  clones), `test_subagent_limit_live.py` (two simultaneous planner sessions —
+  cap 1 serializes with `waitedMs≈24 s`; a live raise to 2 overlaps, `inFlight=2`),
+  `test_delegation_live.py` (brainstormer-first; deterministic zero-delegation
+  turn nudged, resumed and delegated; cap of 2 nudges; toggle-off), and new
+  phases in `test_planner_v2.py` (defaults creation, first-use snapshot,
+  `/planner-status` dialog).
+
+### Changed
+
+- `/planner-config` gained "Max worker→tester cycles", "Re-sync from
+  defaults", and "Global defaults (new projects)".
+- Config writes stamp `plannerVersion`/`updatedAt` and preserve unknown keys;
+  the defaults file is settings-only (no metadata).
+- `install.sh` records `sourceRoot`, writes the global agent marker, creates
+  the defaults file once, and keeps it on uninstall (the agent marker is
+  removed).
+- Debug logging (`PLANNER_DEBUG=1`) can append to `PLANNER_DEBUG_FILE` — the
+  live suites read that file because server stdout is buffered.
+- **The planner keeps short steps.** `planner.md` forbids design documents and
+  implementation reasoning ("keep it short — do not overthink"), treats automatic
+  continuation messages ("Continue working toward the active session goal" and
+  other goal/loop prompts) as "continue the pipeline", and names the exact tools
+  (`subagent`, `question`, `read`/`glob`/`grep`) so models stop inventing names
+  like `ask_user`.
+- **The brainstormer asks questions again** (per the user's requirement): it may
+  use the `question` tool or reply `STATUS: NEEDS_INPUT` with up to 3 numbered
+  questions; the planner relays them to the user with its `question` tool and
+  re-delegates with the answers (max 3 rounds). Unanswered questions fall back to
+  documented assumptions. It also uses the superpowers skills on the FIRST try,
+  writes the spec to the relative path `docs/superpowers/specs/<date>-<slug>.md`,
+  and verifies the file on disk before `STATUS: READY` (`STATUS: FAILED`
+  otherwise) — the plugin guarantees the directory exists on every planner use.
+- **Agent-model pins no longer depend on project agent files.** Pinning is
+  applied whenever the agent exists anywhere (project, global agents dir, or
+  opencode config); previously a missing `<project>/.opencode/agents/<name>.md`
+  made the subagent silently inherit the planner's session model — the exact
+  "I selected a model but it uses the main model" report.
+- `refreshAgentDefinitions(dir, {force})` can overwrite legacy/user-edited agent
+  files after writing `<name>.md.bak` backups; `/planner-status → Refresh agent
+  definitions` offers that explicitly on legacy installs (no marker).
+
+### Fixed
+
+- **Subagent model overrides are stripped.** Models sometimes inject a
+  hallucinated `model` into the `subagent` call (observed:
+  `openai/gpt-5.1-codex-max`), which overrode the configured per-agent model and
+  aborted the delegation with "Model not available". The plugin now drops any
+  per-call `model` from planner-originated subagent calls.
+- **The brainstormer can always write its spec.** The old flow relied on the
+  directory existing at plugin load; a deleted/missing
+  `docs/superpowers/specs/` made the write fail silently and the model reported
+  READY for a file that never existed (it even hallucinated absolute paths like
+  `/home/arnar/mario/...`). The directory is now ensured on every planner use and
+  the spec is verified on disk before READY.
+- **"Tool not available" root causes (real-session diagnosis).** On the user's
+  previous OpenCode build, the delegation tool was named `task` (not
+  `subagent`), the shell tool `bash`, and a denied permission REMOVED the tool
+  from the subagent's toolset — so the stale V1-format global agent files
+  (`agent/brainstormer.md` with `edit: deny`) stripped the brainstormer's
+  `write` tool entirely ("this session exposes no file-write tool") and the
+  plugin's instructions referenced tool names that did not exist there. Fixed:
+  the plugin resolves the delegation tool by name (`subagent`, falling back to
+  `task`) and every injected instruction, nudge, hook and prompt block uses
+  that resolved name; `install.sh` moves stale `agent/<name>.md` copies aside
+  (to `<name>.md.v1bak-<timestamp>`, never deleted) so no build can pick them
+  up again; `extras/tool-name-aliases.js` (installed globally by `install.sh`)
+  now registers an alias only when its canonical tool exists, covers many more
+  hallucinated names, and documents the argument shape in the alias
+  description.
+- **The planner can no longer build the request itself.** The watchdog only
+  nudged on "no subagent call" or "READY spec without worker/tester", so a
+  planner whose brainstormer returned NEEDS_INPUT/FAILED could write the spec
+  (or code) itself and slide through — reproduced from a real session
+  (`brainstorm-v1`). Fixed: file writes/edits by the planner are denied
+  server-side via the permission hook ("delegate this to the subagents"), and
+  the watchdog now also nudges when the brainstormer did not return READY or
+  TRIVIAL and nothing reached the worker/tester. A turn that relayed questions
+  to the user (`question` tool) is a legitimate wait and is never nudged.
+- **Decision questions no longer collapse to yes/no.** A model calling the
+  `ask_user` alias with a bare `question` string got forced Yes/No options
+  invented for it. The alias plugin now derives the REAL alternatives from the
+  question text (letter/number/bullet enumerations, "a, b, or c" lists) and
+  otherwise leaves the question open-ended (the TUI always offers a free-text
+  answer); string options become proper `{label, description}` objects.
+  `brainstormer.md` documents the exact `question` tool shape and requires
+  2-4 concrete alternatives per decision (recommended first, "(Recommended)"),
+  and `planner.md`/the injected block require the planner to relay those
+  options instead of flattening them.
+- New suite: `test_alias_unit.py` (alias input normalization — question option
+  derivation, key aliasing, glob fallbacks, setup() registration harness) in
+  `run_all.sh`; the unit gate gained section 17 (tool-availability +
+  question-options hardening).
+- **Follow-up (same day, real session `ses_ed8eb8d8bffe` in mario):** the
+  brainstormer hallucinated Claude-Code-style MCP tool names
+  (`mcp__local__write_file`, `mcp__local__exec`, …) — the engine rejects
+  unknown names BEFORE any plugin hook fires, so no hook can rewrite them.
+  Fixed by REGISTERING the observed `mcp__local__*` shapes as real alias tools
+  (a real MCP tool with the same name always wins), normalizing file-tool
+  arguments to `path` (the name 2.0.26 accepts live), and adding recovery
+  rules to `planner.md`/`brainstormer.md`/`worker.md` + the injected block:
+  a "No tool named …" error means the NAME was wrong — retry once with the
+  exact canonical names, never `mcp__`-prefixed inventions. The same session
+  also confirmed the planner-side design works: its attempts to write the
+  spec itself fail by design ("no write/edit tools for the planner"), and the
+  prompts now say so explicitly so small models do not spiral after the
+  expected failure. Alias unit harness extended to 20 checks; unit gate to
+  200.
+- **Proactive audit (same evening) — six latent issues found and fixed:**
+  a session that switched planner→Build stayed in the watchdog's tracked set
+  and could get delegation nudges aimed at a Build agent (tracked set now
+  drops sessions whose context reports another agent); the watchdog disabled
+  itself whenever the PROJECT agent files were missing even though global
+  definitions existed (`agentFileExists` now falls back to the global agents
+  dir); a brainstormer `STATUS: NEEDS_INPUT` was indistinguishable from a
+  generic failure for the watchdog (it now nudges with relay-the-questions
+  guidance instead of re-delegate); `/plan` with an empty prompt forwarded
+  `undefined` text (now coerced); `install.sh --update-agents` overwrote
+  user-edited agent files with no backup (now `.bak-<timestamp>` first);
+  the brainstormer could fire several `question` calls in a row (the mario
+  session showed 5 sequential dialogs) — prompts now demand ONE call with up
+  to 3 questions per spec, plus a relative-paths rule after a real
+  `/home/arnen/...` home-directory typo made every search fail. Unit gate at
+  206.
+- **`docs/superpowers/specs/` is no longer created on plugin load.** It was
+  created by `ensureAgentFiles` at setup — every project (even ones that never
+  ran the planner) grew the directory at startup. It is now created exactly
+  when a brainstormer delegation starts (the `execute.before` hook), and
+  nowhere else; `/plan` and the first planner use only snapshot the config.
+  The startup-time investigation also measured fresh TUI/server boots (paint
+  1.1 s, models present, model.list 80-250 ms, session queries indexed) — a
+  "very long" load with an empty model picker was traced to long-running
+  stale `opencode serve` processes (started days before the config changes
+  and deploys), which were stopped; a fresh launch is fast and complete.
+- **The `/planner-config` and Global defaults menus stay open.** Picking a
+  subagent model, a vision model, parallelism or cycles used to close the
+  whole config menu — every additional tweak meant retyping /planner-config
+  and navigating again. Both menus now return to their first page after every
+  action (the dialog re-renders with the fresh values), and close only on Esc
+  or the new "Done — close" option. Verified live over a PTY: pick a model →
+  the menu reopens on the first page; Esc closes.
+- New live suites: `test_agent_models_live.py` (per-agent models actually run,
+  including with project agent files deleted — 11/11) and
+  `test_spec_write_live.py` (spec file on disk + Requirements/Acceptance + full
+  pipeline — 5/5).
+
 ## [0.4.0] - 2026-10-06
 
 OpenCode 2 revival: the plugin actually loads, the TUI dialogs are back, and the

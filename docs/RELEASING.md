@@ -54,8 +54,9 @@ From a checkout, install the published package into an empty scratch project's
 
 Restart OpenCode and confirm: `opencode api plugin.list` shows `planner`
 active; the five agents exist; a normal session is NOT on the planner; pressing
-Tab reaches Planner; `/planner-status` opens the TUI dialog and reports
-`opt-in` + `mcp: disabled`.
+Tab reaches Planner; `/planner-status` opens the TUI dialog and reports the
+running/install versions (and any conflicts); `/planner-config` opens the
+configuration dialog.
 
 ## Preparing the next release
 

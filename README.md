@@ -6,11 +6,13 @@
 - **planner** — a primary agent (reachable with **Tab** or `/plan`). It controls
   the whole flow — brainstorm → spec check → worker → result check → tester —
   and writes no code itself.
-- **brainstormer** — subagent that runs BEFORE the work on non-trivial requests:
-  it reads the superpowers `brainstorming`/`writing-plans` skills and writes an
-  implementation-ready spec to `docs/superpowers/specs/<date>-<slug>.md`.
-  **Fully autonomous**: it never asks questions — ambiguity is resolved with
-  documented assumptions, so nothing blocks waiting for input.
+- **brainstormer** — subagent that runs BEFORE the work on every request: it uses
+  the superpowers `brainstorming`/`writing-plans` skills on the first try, writes
+  an implementation-ready spec to `docs/superpowers/specs/<date>-<slug>.md` (and
+  verifies the file on disk — a spec that is not on disk is reported as failed,
+  never READY). It may ask clarifying questions: they are relayed to you by the
+  planner (and answered back to it, max 3 rounds); if you do not answer, the
+  ambiguity is resolved with documented assumptions.
 - **worker** — subagent that implements the task (and reads the spec first, when
   one exists).
 - **tester** — subagent that verifies the implementation and reports
@@ -23,6 +25,13 @@ untouched — no planner prompt is injected and no default agent is changed.
 MCP servers are managed by OpenCode itself (the native `/mcps` command and the
 `mcp` section of `opencode.json(c)`); this plugin never touches them.
 
+The workflow is **enforced, not advisory**: the brainstormer runs FIRST for
+every request (a turn that skips delegation is resumed by the plugin, max 2
+nudges), the `maxParallelSubagents` cap is a real semaphore around the
+`subagent` tool, and every project gets its own configuration snapshot seeded
+from global defaults. New versions are detected (GitHub, cached 24 h) and can
+be applied with one click from `/planner-status` (`git pull` + `install.sh`).
+
 Each subagent can use a **different LLM model** with an optional per-agent
 **effort variant** (`provider/model#high`). Images are handled three ways: by a
 dedicated vision subagent (**agent**), by an upstream proxy vision bridge
@@ -30,6 +39,38 @@ dedicated vision subagent (**agent**), by an upstream proxy vision bridge
 
 Requires OpenCode 2.x. (OpenCode V1 support ended with v0.3.0; it remains in
 git history.)
+
+---
+
+## Configuration model
+
+- **Global defaults** live in `<opencode config dir>/planner-defaults.json`
+  (`OPENCODE_CONFIG_DIR` or `~/.config/opencode`). Created on first load and by
+  `install.sh`; never overwritten afterwards. Hand-editable, and editable
+  through `/planner-config → Global defaults (new projects)`.
+- **Per-project snapshot**: the first time the planner is used in a project,
+  the current defaults are copied into `<project>/.opencode/planner-plugin.json`
+  with `plannerVersion`, `createdAt` and `source` metadata. Later default
+  edits do not touch existing projects; `/planner-config → Re-sync from
+  defaults` re-pulls them on demand.
+- **Effective config** = project file over global defaults over built-ins.
+  Unknown keys are always preserved.
+
+## Versioning & updates
+
+- Project configs and agent definitions carry version stamps; a project-local
+  plugin copy (`.opencode/plugins/opencode-planner`) is detected too.
+- **`/planner-status`** (TUI dialog; palette entry "Planner: status & updates")
+  lists the running/install/config/agent/local-copy versions, the latest
+  version on GitHub (read-only check, cached 24 h, silent offline) and any
+  conflicts. Actions: **Check for updates**, **Refresh agent definitions**
+  (updates only files the plugin wrote — user-edited files are kept), and
+  **Update now** (confirmation → `git pull --ff-only` + `install.sh --yes`
+  from the source clone recorded at install time → restart notice; a failed
+  pull aborts instead of reinstalling a stale tree).
+- A one-time startup toast warns about an available update or version
+  conflicts. Set `PLANNER_NO_UPDATE_CHECK=1` to disable the automatic startup
+  check (the manual "Check for updates" button still works).
 
 ---
 
@@ -92,27 +133,46 @@ when connected to a **remote** server (CLI-only plugins list).
 - Press **Tab** to switch to the **Planner** agent in a session (it is not the
   default), or type `/plan <request>` to switch and send in one step.
 - Type a request; the planner controls the flow step by step:
-  **brainstormer** (spec, non-trivial work) → the planner **reads and checks the
-  spec itself** → **worker** (implementation) → the planner **checks the
+  **brainstormer** (ALWAYS first — enforced) → the planner **reads and checks
+  the spec itself** → **worker** (implementation) → the planner **checks the
   changed files** → **tester** (verification). On `STATUS: FAIL` it re-delegates
-  to the worker with the feedback, up to `maxCycles` times.
-- The brainstormer never asks you anything: it resolves ambiguity with
-  documented assumptions in the spec, so the flow never blocks.
-- Configuration is per project and lives in one file:
-  `.opencode/planner-plugin.json`.
+  to the worker with the feedback, up to `maxCycles` times. A turn that ends
+  without delegation is resumed by the plugin's watchdog.
+- The brainstormer writes and verifies its spec file itself; if something is
+  genuinely ambiguous it asks you through the planner (max 3 question rounds) —
+  every decision question comes with **2-4 concrete options to pick from**
+  (the recommended one first, plus a free-text answer field), never a
+  yes/no flattening of an open choice. No answer means the assumption is
+  documented in the spec instead.
+- The planner never builds the request itself: file writes by the planner are
+  denied server-side, and the watchdog also resumes turns where the
+  brainstormer came back without a usable spec (previously the planner would
+  "helpfully" write the spec itself).
+- Small local models that hallucinate tool names (`bash`, `ask_user`, `task`,
+  `read_file`, `list_dir`, …) are covered by the globally installed
+  `tool-name-aliases.js` helper (shipped in `extras/`, installed by
+  `install.sh`): aliases map onto the canonical OpenCode tools, arguments are
+  normalized, and an alias is never registered for a tool that does not exist.
+- Configuration is per project: `.opencode/planner-plugin.json`, snapshotted
+  from the global `planner-defaults.json` on first use.
 
 ### Commands
 
 - **`/plan <request>`** — switches the session to Planner and sends the request.
 - **`/planner-config`** — **opens the configuration dialog in the TUI**:
-  brainstormer / worker / tester / vision model + effort variant, and max
-  parallel subagents. It is provided by the TUI plugin, so typing it in the
-  terminal always pops the dialog (no duplicate text command).
+  brainstormer / worker / tester / vision model + effort variant, max parallel
+  subagents, max worker→tester cycles, delegation enforcement, **Re-sync from
+  defaults** and **Global defaults (new projects)**.
+- **`/planner-status`** — version/conflict overview with **Check for updates**,
+  **Refresh agent definitions** and **Update now** (pull + reinstall + restart
+  notice).
 - Vision and parallelism also have `ctrl+p` palette entries
-  (`Planner: configure vision`, `Planner: subagent parallelism`).
+  (`Planner: configure vision`, `Planner: subagent parallelism`,
+  `Planner: status & updates`).
 
 The server registers no planner command besides `/plan`. Outside the TUI,
-configuration lives in `.opencode/planner-plugin.json` (see below).
+configuration lives in `.opencode/planner-plugin.json` (seeded from
+`planner-defaults.json`; see below).
 
 ### Example config
 
@@ -122,16 +182,23 @@ configuration lives in `.opencode/planner-plugin.json` (see below).
   "variants": { "worker": "high" },
   "maxCycles": 3,
   "maxParallelSubagents": 1,
-  "vision": { "enabled": true, "model": "goproxy/deepseek-v4-flash-vision-exp", "mode": "agent" }
+  "enforceDelegation": true,
+  "vision": { "enabled": true, "model": "goproxy/deepseek-v4-flash-vision-exp", "mode": "agent" },
+  "plannerVersion": "0.5.0",
+  "createdAt": "2026-10-10T12:00:00.000Z",
+  "source": "defaults"
 }
 ```
 
-- `maxParallelSubagents` (default **1 — strictly serial**): how many subagent
-  tasks may run at once. Keep it at 1 for single-slot local model servers; raise
-  it only if your server handles concurrency. The value is injected into the
-  planner's system prompt (planner requests only).
-- With no config file nothing is pinned: subagents inherit the session's main
-  model.
+- `maxParallelSubagents` (default **1 — strictly serial**): **enforced** — a
+  semaphore around the `subagent` tool queues extra calls; 1 means one subagent
+  task at a time. Raise it only if your server handles concurrency.
+- `enforceDelegation` (default **true**): the watchdog resumes planner turns
+  that skip the subagents (max 2 nudges per turn).
+- The `plannerVersion`/`createdAt`/`source` keys are written by the plugin —
+  edit only if you know what you are doing.
+- With no config file, the effective settings are the global defaults;
+  subagents inherit the session's main model unless a model is set.
 
 ---
 
@@ -182,12 +249,19 @@ one-line `Screenshot captured: <path>` note in the owning session.
 ## Tests
 
 ```bash
+bash    tests/e2e/run_all.sh              # the five suites below together
 python3 tests/e2e/unit_gate.py            # static gates (layout, contracts, installer)
-python3 tests/e2e/test_planner_config.py  # installer sandbox + config contract
-python3 tests/e2e/test_planner_v2.py      # real OpenCode 2 server: agents, opt-in, commands, TUI dialogs
-bash    tests/e2e/run_all.sh              # the three suites above
+python3 tests/e2e/test_semaphore_unit.py  # subagent-cap semaphore logic
+python3 tests/e2e/test_update_unit.py     # version compare, status detection, agent refresh, update execution (fake clones)
+python3 tests/e2e/test_planner_config.py  # installer sandbox + defaults + markers + config contract
+python3 tests/e2e/test_planner_v2.py      # real OpenCode 2 server: agents, opt-in, snapshot, TUI dialogs
 
 # Long real-model validation (needs a live provider; takes minutes):
+python3 -u tests/e2e/test_subagent_limit_live.py   # concurrency cap on a real instance (two simultaneous sessions)
+python3 -u tests/e2e/test_delegation_live.py       # watchdog: nudge, resume, cap, toggle-off
+python3 -u tests/e2e/test_agent_models_live.py     # per-agent pins actually run (incl. missing project agent files)
+python3 -u tests/e2e/test_spec_write_live.py       # brainstormer writes + verifies the spec file, pipeline runs
+python3 -u tests/e2e/test_question_live.py         # question round: decision questions carry REAL options (never forced yes/no)
 python3 tests/e2e/long_session_test.py --label A --cycles 2
 python3 tests/e2e/long_session_test.py --task mario --label M --cycles 3   # Mario card game
 
@@ -195,6 +269,9 @@ python3 tests/e2e/long_session_test.py --task mario --label M --cycles 3   # Mar
 # dashboard request log (credentials via env, never committed):
 GOPROXY_UI_PASSWORD=... python3 tests/e2e/test_model_switch_live.py
 ```
+
+The live suites read the plugin's debug log via `PLANNER_DEBUG=1` +
+`PLANNER_DEBUG_FILE=<path>` (server stdout is buffered).
 
 The long test's `--task mario` builds a Mario-themed card game over several
 worker→tester cycles (brainstormer spec → 3 cycles), verified without a browser
@@ -211,14 +288,16 @@ global OpenCode setup cannot leak into the results.
 
 ```
 src/
-  index.ts      V2 server plugin: agent install, transforms, hooks, commands
-  core.ts       config schema/IO (atomic), model specs, agent templates, vision instructions
+  index.ts      V2 server plugin: agent install, transforms, hooks, watchdog, commands
+  core.ts       config schema/IO (atomic), global defaults + snapshots, agent markers,
+                version compare/status, update check + execution, model specs, templates
+  semaphore.ts  async semaphore behind the enforced maxParallelSubagents cap
   commands.ts   dialog operations shared by core and the TUI
-  tui.ts        V2 CLI plugin: /planner-config dialog + palette entries (package "./tui" export)
+  tui.ts        V2 CLI plugin: /planner-config + /planner-status dialogs, palette entries
 index.ts tui.ts root re-exports for plugin-directory discovery
 agents-v2/      V2 agent definitions (planner/brainstormer/worker/tester/vision)
-tests/e2e/      Python suites
-install.sh      global installer/uninstaller (V2)
+tests/e2e/      Python + TS-harness suites (see Tests)
+install.sh      global installer/uninstaller (V2; records sourceRoot, markers, defaults)
 docs/planner-plugin.md
 ```
 

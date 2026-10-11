@@ -450,8 +450,11 @@ def main():
         # ------------------------------------------------------------ planner
         print(f"[{args.label}] planner session ({args.task}, {args.cycles} worker→tester cycles)…")
         sid = ((api.api("session.create", body={"title": f"planner-{args.label}"}) or {}).get("data") or {}).get("id")
+        # session.prompt does not honor an `agent` field on this build — switch
+        # the session agent explicitly (the same call /plan uses).
+        api.api("session.switchAgent", {"sessionID": sid}, body={"agent": "planner"})
         prompt = build_task(args.task, args.label, args.cycles)
-        api.prompt_async(sid, prompt, agent="planner")
+        api.prompt_async(sid, prompt)
         done = False
         last_report = 0
         deadline = time.time() + args.timeout

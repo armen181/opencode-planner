@@ -9,3 +9,5 @@ __pycache__/
 .opencode/
 *.tgz
 tests/e2e/longtest-*.json
+tests/e2e/delegation-report.json
+tests/e2e/subagent-limit-report.json

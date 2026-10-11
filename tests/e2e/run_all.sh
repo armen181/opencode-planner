@@ -10,7 +10,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-suites=(unit_gate test_planner_config test_planner_v2)
+suites=(unit_gate test_semaphore_unit test_update_unit test_alias_unit test_planner_config test_planner_v2)
 
 if [ "${1:-}" ]; then
   suites=("$1")

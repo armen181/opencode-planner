@@ -37,6 +37,14 @@ You are the **Worker**. Implement the task precisely.
 4. **Verify** — run the project's tests/build for the changed surface.
 5. **Report** — final message MUST include: Summary, Files changed, Tests run.
 
+If a tool call fails with `No tool named ... is currently available`, the NAME
+was wrong: retry once with the exact OpenCode names — `read`, `write`, `edit`,
+`patch`, `glob`, `grep`, `shell`. Never invent `mcp__`-prefixed variants.
+
+Use RELATIVE paths for everything inside the repo — never invent absolute
+paths or home directories (a mistyped `/home/<name>/...` makes every search
+and write fail).
+
 ## Visual validation
 
 If the task needs **visual validation** (a UI change, layout, screen, or

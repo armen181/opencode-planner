@@ -9,6 +9,14 @@
 #     what powers the /planner-* popup dialogs.
 #   $CONFIG_DIR/agents/{planner,brainstormer,worker,tester,vision}.md
 #     Global V2 agent definitions (only written when missing — edits are kept).
+#     Stale V1-era copies in $CONFIG_DIR/agent/ (singular, read by older
+#     builds, where they could strip the subagents' tools) are moved aside to
+#     <name>.md.v1bak-<timestamp>.
+#   $CONFIG_DIR/plugins/tool-name-aliases.js
+#     The extras/tool-name-aliases.js helper: maps model-hallucinated tool
+#     names (bash, ask_user, task, read_file, ...) onto the canonical OpenCode
+#     tools and normalizes their arguments. Updated on every install when the
+#     existing copy is ours; left alone otherwise and kept on uninstall.
 #
 # The planner is OPT-IN: normal sessions are untouched. Press Tab to switch to
 # the Planner agent (or use /plan). MCP servers are managed by OpenCode itself
@@ -46,6 +54,7 @@ PLUGINS_DIR="$CONFIG_DIR/plugins"
 PLUGIN_DIR="$PLUGINS_DIR/opencode-planner"
 AGENTS_DIR="$CONFIG_DIR/agents"
 VERSION_FILE="$PLUGIN_DIR/.planner-install.json"
+DEFAULTS_FILE="$CONFIG_DIR/planner-defaults.json"
 
 # Names the planner has installed over its history (V1 and the early V2
 # single-file drop). They must not stay in plugins/: a top-level .ts file is
@@ -62,6 +71,14 @@ SOURCE_VERSION="${SOURCE_VERSION:-0.0.0}"
 
 say() { printf '%s\n' "$*"; }
 warn() { printf '  WARNING: %s\n' "$*"; }
+
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
 
 is_interactive() { [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; }
 
@@ -153,18 +170,96 @@ install_internal() {
     if [ -f "$AGENTS_DIR/$a.md" ] && [ "$UPDATE_AGENTS" != 1 ]; then
       say "  kept existing agents/$a.md (use --update-agents to overwrite)"
     else
+      # --update-agents overwrites; a file that differs from the template is a
+      # user edit — back it up instead of destroying it silently.
+      if [ -f "$AGENTS_DIR/$a.md" ] && ! cmp -s "$AGENTS_DIR/$a.md" "$ROOT/agents-v2/$a.md"; then
+        cp "$AGENTS_DIR/$a.md" "$AGENTS_DIR/$a.md.bak-$(date +%Y%m%d-%H%M%S)"
+        warn "agents/$a.md differed from the template — old copy backed up"
+      fi
       cp "$ROOT/agents-v2/$a.md" "$AGENTS_DIR/$a.md"
       say "  installed agents/$a.md"
     fi
   done
 
+  # Stale V1-era definitions: OpenCode also reads CONFIG_DIR/agent/ (singular),
+  # where the old 1.x-line plugin dropped map-format files with `edit: deny` —
+  # on those builds a denied permission REMOVED the tool from the subagent's
+  # toolset (the brainstormer lost `write` and could not write its spec). The
+  # current templates live in agents/ (plural), which takes precedence on 2.x;
+  # move the stale singular copies out of the way (never deleted) so no older
+  # build can pick them up again.
+  if [ -d "$CONFIG_DIR/agent" ]; then
+    local stamp
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    for a in "${AGENT_NAMES[@]}"; do
+      if [ -f "$CONFIG_DIR/agent/$a.md" ] && [ -f "$AGENTS_DIR/$a.md" ]; then
+        mv "$CONFIG_DIR/agent/$a.md" "$CONFIG_DIR/agent/$a.md.v1bak-$stamp"
+        say "  moved stale agent/$a.md aside (agent/$a.md.v1bak-$stamp)"
+      fi
+    done
+  fi
+
+  # The tool-name-aliases helper (extras/tool-name-aliases.js) maps model
+  # hallucinated tool names (bash, ask_user, task, read_file, ...) onto the
+  # canonical OpenCode tools and normalizes their arguments. It benefits every
+  # session, so it is installed globally and left in place on uninstall.
+  if [ -f "$ROOT/extras/tool-name-aliases.js" ]; then
+    if [ ! -f "$PLUGINS_DIR/tool-name-aliases.js" ] || grep -q 'id: "tool-name-aliases"' "$PLUGINS_DIR/tool-name-aliases.js" 2>/dev/null; then
+      cp "$ROOT/extras/tool-name-aliases.js" "$PLUGINS_DIR/tool-name-aliases.js"
+      say "  installed plugins/tool-name-aliases.js"
+    else
+      warn "kept existing plugins/tool-name-aliases.js (not ours — review manually)"
+    fi
+  fi
+
   {
     printf '{\n'
     printf '  "name": "opencode-planner",\n'
     printf '  "version": "%s",\n' "$SOURCE_VERSION"
+    printf '  "sourceRoot": "%s",\n' "$ROOT"
     printf '  "installedAt": "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf '}\n'
   } > "$VERSION_FILE"
+
+  # Agent-definition marker (version + hashes of the template-identical files)
+  # so the update flow can refresh what we wrote and keep user edits.
+  {
+    printf '{\n'
+    printf '  "version": "%s",\n' "$SOURCE_VERSION"
+    printf '  "writtenAt": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '  "hashes": {'
+    local first=1 a h
+    for a in "${AGENT_NAMES[@]}"; do
+      [ -f "$AGENTS_DIR/$a.md" ] || continue
+      [ -f "$ROOT/agents-v2/$a.md" ] || continue
+      cmp -s "$AGENTS_DIR/$a.md" "$ROOT/agents-v2/$a.md" || continue
+      h="$(hash_file "$AGENTS_DIR/$a.md")"
+      if [ "$first" = 1 ]; then first=0; else printf ','; fi
+      printf '\n    "%s": "%s"' "$a" "$h"
+    done
+    printf '\n  }\n'
+    printf '}\n'
+  } > "$AGENTS_DIR/.planner-agents.json"
+
+  # Global defaults: seeds every project's first planner snapshot. Created
+  # once; a user-edited file is never overwritten by an update.
+  if [ ! -f "$DEFAULTS_FILE" ]; then
+    cat > "$DEFAULTS_FILE" <<'JSON'
+{
+  "models": { "planner": "", "brainstormer": "", "worker": "", "tester": "" },
+  "variants": {},
+  "maxCycles": 3,
+  "maxParallelSubagents": 1,
+  "enforceDelegation": true,
+  "screenshotNotes": false,
+  "skillsPath": "",
+  "vision": { "enabled": false, "model": "", "mode": "agent" }
+}
+JSON
+    say "  created planner-defaults.json (global defaults for new projects)"
+  else
+    say "  kept existing planner-defaults.json"
+  fi
 }
 
 uninstall_internal() {
@@ -182,6 +277,13 @@ uninstall_internal() {
       warn "agents/$a.md differs from the template — left in place (your edits survive)"
     fi
   done
+  if [ -f "$DEFAULTS_FILE" ]; then
+    say "  kept planner-defaults.json (your global defaults survive an uninstall)"
+  fi
+  if [ -f "$AGENTS_DIR/.planner-agents.json" ]; then
+    rm -f "$AGENTS_DIR/.planner-agents.json"
+    say "  removed agents/.planner-agents.json"
+  fi
 }
 
 next_steps() {

@@ -5,8 +5,9 @@
  * server plugin and the TUI dialogs share lives here.
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { createHash } from "node:crypto"
 import { homedir, tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 /** Where the brainstormer reads the superpowers skills from (brainstorming,
@@ -47,6 +48,9 @@ export interface PlannerConfig {
   /** How many subagent tasks the planner may run at the same time. 1 (the
    *  default) means strictly serial — right for single-slot local servers. */
   maxParallelSubagents: number
+  /** Watchdog: nudge the planner when it ends a turn without delegating to the
+   *  subagents (brainstormer first; worker+tester for changes). Default true. */
+  enforceDelegation: boolean
   /** Post a one-line `Screenshot captured: <path>` note for fresh screenshots.
    *  Off by default: the path is already in the subagent's own tool output. */
   screenshotNotes?: boolean
@@ -108,6 +112,32 @@ export function plannerConfigPath(repo: string): string {
   return join(repo, ".opencode", "planner-plugin.json")
 }
 
+/** User-level opencode config directory (same resolution install.sh uses). */
+export function configDir(): string {
+  if (process.env.OPENCODE_CONFIG_DIR) return process.env.OPENCODE_CONFIG_DIR
+  const xdg = process.env.XDG_CONFIG_HOME
+  return join(xdg && xdg.trim() ? xdg : join(homedir(), ".config"), "opencode")
+}
+
+/** Global defaults file: seeds every project's first planner snapshot. */
+export function defaultsConfigPath(): string {
+  return join(configDir(), "planner-defaults.json")
+}
+
+let cachedVersion: string | undefined
+
+/** The version of THIS running plugin copy (read from its package.json). */
+export function pluginVersion(): string {
+  if (cachedVersion !== undefined) return cachedVersion
+  try {
+    const pkg = JSON.parse(readFileSync(join(packageRoot(), "package.json"), "utf8")) as { version?: unknown }
+    cachedVersion = typeof pkg.version === "string" && pkg.version ? pkg.version : "0.0.0"
+  } catch {
+    cachedVersion = "0.0.0"
+  }
+  return cachedVersion
+}
+
 /** Migrate a legacy `.opencode/planner.json` to the current file name. No-op
  *  when the new file already exists or no legacy file is present. */
 export function migrateLegacyConfig(repo: string): void {
@@ -132,6 +162,7 @@ export function defaultPlannerConfig(): PlannerConfig {
     variants: {},
     maxCycles: 3,
     maxParallelSubagents: 1,
+    enforceDelegation: true,
     screenshotNotes: false,
     skillsPath: DEFAULT_SKILLS_PATH,
     vision: { enabled: false, model: "", mode: "agent" },
@@ -149,56 +180,77 @@ function normalizeVisionMode(value: unknown): VisionMode {
   return value === "native" || value === "proxy" || value === "agent" ? value : "agent"
 }
 
-export function readPlannerConfig(repo: string): PlannerConfig {
-  const base = defaultPlannerConfig()
-  const path = plannerConfigPath(repo)
-  if (!existsSync(path)) return base
-  try {
-    const data = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>
-    const models = (data.models ?? {}) as Partial<PlannerModels>
-    const variants = (data.variants ?? {}) as Partial<Record<PlannerAgent, string>>
-    const vision = (data.vision ?? {}) as Partial<VisionConfig>
-    return {
-      models: { ...base.models, ...models },
-      variants: { ...base.variants, ...variants },
-      maxCycles:
-        typeof data.maxCycles === "number" && data.maxCycles > 0 ? Math.floor(data.maxCycles) : base.maxCycles,
-      maxParallelSubagents: normalizeMaxParallel(data.maxParallelSubagents, base.maxParallelSubagents),
-      screenshotNotes:
-        typeof data.screenshotNotes === "boolean" ? data.screenshotNotes : base.screenshotNotes,
-      skillsPath:
-        typeof data.skillsPath === "string" && data.skillsPath ? data.skillsPath : base.skillsPath,
-      vision: {
-        enabled: typeof vision.enabled === "boolean" ? vision.enabled : base.vision.enabled,
-        model: typeof vision.model === "string" ? vision.model : base.vision.model,
-        variant: typeof vision.variant === "string" ? vision.variant : undefined,
-        mode: normalizeVisionMode(vision.mode ?? base.vision.mode),
-      },
-    }
-  } catch {
-    return base
+/** Normalize one parsed config object over a base (used for both the project
+ *  file and the global defaults file). */
+function configFromData(data: Record<string, unknown>, base: PlannerConfig): PlannerConfig {
+  const models = (data.models ?? {}) as Partial<PlannerModels>
+  const variants = (data.variants ?? {}) as Partial<Record<PlannerAgent, string>>
+  const vision = (data.vision ?? {}) as Partial<VisionConfig>
+  return {
+    models: { ...base.models, ...models },
+    variants: { ...base.variants, ...variants },
+    maxCycles:
+      typeof data.maxCycles === "number" && data.maxCycles > 0 ? Math.floor(data.maxCycles) : base.maxCycles,
+    maxParallelSubagents: normalizeMaxParallel(data.maxParallelSubagents, base.maxParallelSubagents),
+    enforceDelegation:
+      typeof data.enforceDelegation === "boolean" ? data.enforceDelegation : base.enforceDelegation,
+    screenshotNotes:
+      typeof data.screenshotNotes === "boolean" ? data.screenshotNotes : base.screenshotNotes,
+    skillsPath:
+      typeof data.skillsPath === "string" && data.skillsPath ? data.skillsPath : base.skillsPath,
+    vision: {
+      enabled: typeof vision.enabled === "boolean" ? vision.enabled : base.vision.enabled,
+      model: typeof vision.model === "string" ? vision.model : base.vision.model,
+      variant: typeof vision.variant === "string" ? vision.variant : undefined,
+      mode: normalizeVisionMode(vision.mode ?? base.vision.mode),
+    },
   }
 }
 
-/** Write the config back, preserving fields we do not own (a newer plugin or
- *  a human may have added keys) and writing atomically. */
-export function writePlannerConfig(repo: string, cfg: PlannerConfig): void {
-  const odir = join(repo, ".opencode")
-  mkdirSync(odir, { recursive: true })
-  const path = plannerConfigPath(repo)
-  let base: Record<string, unknown> = {}
+function readJsonObject(path: string): Record<string, unknown> | undefined {
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8"))
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) base = parsed
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>
   } catch {
-    base = {}
+    // missing or malformed
   }
+  return undefined
+}
+
+/** The global defaults (built-in defaults when the file is missing/broken). */
+export function readDefaultsConfig(): PlannerConfig {
+  const base = defaultPlannerConfig()
+  const data = readJsonObject(defaultsConfigPath())
+  return data ? configFromData(data, base) : base
+}
+
+/** The EFFECTIVE project config: the project file over the global defaults,
+ *  over the built-in defaults. A project without a file gets the defaults. */
+export function readPlannerConfig(repo: string): PlannerConfig {
+  const base = readDefaultsConfig()
+  const data = readJsonObject(plannerConfigPath(repo))
+  if (!data) return base
+  const cfg = configFromData(data, base)
+  // `variants` is override-if-present: a project that specifies variants owns
+  // the whole map (an empty map clears inherited variants).
+  if ("variants" in data) {
+    const variants = data.variants
+    cfg.variants = variants && typeof variants === "object" && !Array.isArray(variants)
+      ? { ...(variants as Partial<Record<PlannerAgent, string>>) }
+      : {}
+  }
+  return cfg
+}
+
+/** Settings payload shared by the project and defaults writers. */
+function serializeConfig(base: Record<string, unknown>, cfg: PlannerConfig): Record<string, unknown> {
   const merged: Record<string, unknown> = {
     ...base,
     models: { ...((base.models as object) ?? {}), ...cfg.models },
     variants: { ...(cfg.variants ?? {}) },
     maxCycles: cfg.maxCycles,
     maxParallelSubagents: normalizeMaxParallel(cfg.maxParallelSubagents, 1),
+    enforceDelegation: cfg.enforceDelegation !== false,
     screenshotNotes: cfg.screenshotNotes === true,
     skillsPath: typeof cfg.skillsPath === "string" && cfg.skillsPath ? cfg.skillsPath : DEFAULT_SKILLS_PATH,
     vision: { ...((base.vision as object) ?? {}), ...cfg.vision },
@@ -206,9 +258,487 @@ export function writePlannerConfig(repo: string, cfg: PlannerConfig): void {
   // The plugin used to own an `mcp.enabled` switch; MCP servers are managed by
   // OpenCode natively now, so drop our stale key on the next write.
   delete merged.mcp
-  const tmp = join(odir, `.planner-plugin.json.${process.pid}.tmp`)
-  writeFileSync(tmp, JSON.stringify(merged, null, 2) + "\n")
+  return merged
+}
+
+function writeJsonAtomic(path: string, value: unknown): void {
+  const tmp = join(dirname(path), `.${process.pid}.planner.tmp`)
+  writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n")
   renameSync(tmp, path)
+}
+
+/** Write the global defaults file (settings only — never project metadata). */
+export function writeDefaultsConfig(cfg: PlannerConfig): void {
+  const dir = configDir()
+  mkdirSync(dir, { recursive: true })
+  const path = defaultsConfigPath()
+  const merged = serializeConfig(readJsonObject(path) ?? {}, cfg)
+  delete merged.plannerVersion
+  delete merged.createdAt
+  delete merged.updatedAt
+  delete merged.source
+  writeJsonAtomic(path, merged)
+}
+
+/** Create the global defaults file when missing. Returns true when created. */
+export function ensureDefaultsFile(): boolean {
+  const path = defaultsConfigPath()
+  if (existsSync(path)) return false
+  try {
+    writeDefaultsConfig(defaultPlannerConfig())
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Edit the global defaults in place. */
+export function updateDefaults(update: (cfg: PlannerConfig) => void): PlannerConfig {
+  const cfg = readDefaultsConfig()
+  update(cfg)
+  writeDefaultsConfig(cfg)
+  return cfg
+}
+
+/** Edit the project config (effective values) in place. */
+export function updatePlannerConfig(repo: string, update: (cfg: PlannerConfig) => void): PlannerConfig {
+  const cfg = readPlannerConfig(repo)
+  update(cfg)
+  writePlannerConfig(repo, cfg)
+  return cfg
+}
+
+/** Write the project config back, preserving fields we do not own (a newer
+ *  plugin or a human may have added keys) and writing atomically. Stamps the
+ *  plugin version + updatedAt; `extra` adds snapshot metadata. */
+export function writePlannerConfig(repo: string, cfg: PlannerConfig, extra?: Record<string, unknown>): void {
+  const odir = join(repo, ".opencode")
+  mkdirSync(odir, { recursive: true })
+  const path = plannerConfigPath(repo)
+  const merged = serializeConfig(readJsonObject(path) ?? {}, cfg)
+  merged.plannerVersion = pluginVersion()
+  merged.updatedAt = new Date().toISOString()
+  if (extra) Object.assign(merged, extra)
+  writeJsonAtomic(path, merged)
+}
+
+/** Create a JSON file only when it does not exist (atomic create-or-fail). */
+function writeJsonIfAbsent(path: string, value: unknown): boolean {
+  try {
+    writeFileSync(path, JSON.stringify(value, null, 2) + "\n", { flag: "wx" })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** First planner use in a project: materialize the current global defaults as
+ *  the project's own copy. Atomic create-or-fail — an existing file (user-made
+ *  or a concurrent writer) is never overwritten. */
+export function snapshotProjectConfig(repo: string): boolean {
+  const path = plannerConfigPath(repo)
+  if (existsSync(path)) return false
+  const now = new Date().toISOString()
+  const merged = serializeConfig({}, readDefaultsConfig())
+  merged.plannerVersion = pluginVersion()
+  merged.createdAt = now
+  merged.updatedAt = now
+  merged.source = "defaults"
+  try {
+    mkdirSync(join(repo, ".opencode"), { recursive: true })
+  } catch {
+    return false
+  }
+  return writeJsonIfAbsent(path, merged)
+}
+
+/** Replace the project settings with a fresh snapshot of the global defaults
+ *  (keeps createdAt/source metadata up to date). */
+export function resyncProjectConfig(repo: string): void {
+  const existing = readJsonObject(plannerConfigPath(repo))
+  const createdAt =
+    existing && typeof existing.createdAt === "string" ? existing.createdAt : new Date().toISOString()
+  writePlannerConfig(repo, readDefaultsConfig(), {
+    createdAt,
+    source: "defaults",
+    resyncedAt: new Date().toISOString(),
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Versioning, agent-definition markers, update flow (R4)
+// ---------------------------------------------------------------------------
+
+/** Where the installer records what it installed (version + source clone). */
+export function installMarkerPath(): string {
+  return join(configDir(), "plugins", "opencode-planner", ".planner-install.json")
+}
+
+export interface InstallInfo {
+  version?: string
+  sourceRoot?: string
+  installedAt?: string
+}
+
+export function readInstallInfo(): InstallInfo {
+  const data = readJsonObject(installMarkerPath())
+  if (!data) return {}
+  return {
+    version: typeof data.version === "string" ? data.version : undefined,
+    sourceRoot: typeof data.sourceRoot === "string" ? data.sourceRoot : undefined,
+    installedAt: typeof data.installedAt === "string" ? data.installedAt : undefined,
+  }
+}
+
+/** Global agents directory (installer target). */
+export function globalAgentsDir(): string {
+  return join(configDir(), "agents")
+}
+
+/** Agents directory inside a project. */
+export function projectAgentsDir(repo: string): string {
+  return join(repo, ".opencode", "agents")
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex")
+}
+
+export interface AgentMarker {
+  version: string
+  writtenAt: string
+  /** Hash of every file this plugin wrote (used to detect user edits). */
+  hashes: Record<string, string>
+}
+
+export function agentMarkerPath(dir: string): string {
+  return join(dir, ".planner-agents.json")
+}
+
+export function readAgentMarker(dir: string): AgentMarker | undefined {
+  const data = readJsonObject(agentMarkerPath(dir))
+  if (!data) return undefined
+  return {
+    version: typeof data.version === "string" ? data.version : "0.0.0",
+    writtenAt: typeof data.writtenAt === "string" ? data.writtenAt : "",
+    hashes:
+      data.hashes && typeof data.hashes === "object" && !Array.isArray(data.hashes)
+        ? (data.hashes as Record<string, string>)
+        : {},
+  }
+}
+
+/** Write the agent marker file for a directory (version + per-file hashes). */
+export function flushAgentMarker(dir: string, marker: AgentMarker): void {
+  try {
+    writeJsonAtomic(agentMarkerPath(dir), marker)
+  } catch {
+    // best-effort
+  }
+}
+
+/** Compare "1.2.3"-style versions. Returns -1 / 0 / 1. */
+export function compareVersions(a: string, b: string): number {
+  const split = (v: string) =>
+    v
+      .replace(/^v/, "")
+      .split(/[.\-+]/)
+      .map((p) => (/^\d+$/.test(p) ? Number(p) : p))
+  const aa = split(a)
+  const bb = split(b)
+  for (let i = 0; i < Math.max(aa.length, bb.length); i++) {
+    const x = aa[i]
+    const y = bb[i]
+    if (x === undefined) {
+      // b has extra segments: numeric extras are higher, prerelease tags lower
+      return typeof y === "number" ? -1 : 1
+    }
+    if (y === undefined) {
+      return typeof x === "number" ? 1 : -1
+    }
+    if (typeof x === "number" && typeof y === "number") {
+      if (x !== y) return x < y ? -1 : 1
+      continue
+    }
+    const sx = String(x)
+    const sy = String(y)
+    if (sx !== sy) return sx < sy ? -1 : 1
+  }
+  return 0
+}
+
+/** Version of a plugin copy on disk (its package.json), if present. */
+export function versionOfPluginDir(dir: string): string | undefined {
+  const data = readJsonObject(join(dir, "package.json"))
+  const version = data?.version
+  return typeof version === "string" && version ? version : undefined
+}
+
+/** Project-local plugin copy, when a project carries its own. */
+export function projectPluginDir(repo: string): string {
+  return join(repo, ".opencode", "plugins", "opencode-planner")
+}
+
+export interface VersionStatus {
+  running: string
+  install?: InstallInfo
+  projectConfigVersion?: string
+  projectAgentsMarker?: AgentMarker
+  globalAgentsMarker?: AgentMarker
+  localPluginVersion?: string
+  mismatch: boolean
+  notes: string[]
+}
+
+/** Detect version conflicts between the running plugin and the project. */
+export function detectVersionStatus(repo: string): VersionStatus {
+  const running = pluginVersion()
+  const install = readInstallInfo()
+  const projCfg = readJsonObject(plannerConfigPath(repo))
+  const projectConfigVersion =
+    projCfg && typeof projCfg.plannerVersion === "string" ? projCfg.plannerVersion : undefined
+  const projectAgentsMarker = readAgentMarker(projectAgentsDir(repo))
+  const globalAgentsMarker = readAgentMarker(globalAgentsDir())
+  const localPluginVersion = existsSync(projectPluginDir(repo))
+    ? versionOfPluginDir(projectPluginDir(repo))
+    : undefined
+  const notes: string[] = []
+  let mismatch = false
+  const differs = (v: string | undefined, what: string) => {
+    if (!v || v === running) return
+    mismatch = true
+    const cmp = compareVersions(v, running)
+    notes.push(`${what} was written by v${v} (${cmp < 0 ? "older" : "newer"} than running v${running})`)
+  }
+  differs(projectConfigVersion, "this project's config")
+  differs(projectAgentsMarker?.version, "this project's agent definitions")
+  differs(localPluginVersion, "the project-local plugin copy")
+  if (install.version && install.version !== running) {
+    notes.push(`the global install is v${install.version} (running v${running})`)
+  }
+  return {
+    running,
+    install,
+    projectConfigVersion,
+    projectAgentsMarker,
+    globalAgentsMarker,
+    localPluginVersion,
+    mismatch,
+    notes,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// "Latest available" check (GitHub, cached) + update execution
+// ---------------------------------------------------------------------------
+
+const UPDATE_REPO = "armen181/opencode-planner"
+const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000
+
+export function updateCheckPath(): string {
+  return join(configDir(), "planner-update-check.json")
+}
+
+export interface LatestCheck {
+  latest?: string
+  checkedAt?: number
+  error?: string
+}
+
+/** Read the cached GitHub check (undefined when stale/absent). */
+export function readCachedLatest(force = false): LatestCheck | undefined {
+  const data = readJsonObject(updateCheckPath())
+  if (!data) return undefined
+  const checkedAt = typeof data.checkedAt === "number" ? data.checkedAt : 0
+  const latest = typeof data.latest === "string" ? data.latest : undefined
+  const error = typeof data.error === "string" ? data.error : undefined
+  if (!force && Date.now() - checkedAt > UPDATE_CHECK_MS) return undefined
+  return { latest, checkedAt, error }
+}
+
+/** Query GitHub for the latest version (raw package.json on the default
+ *  branch). Caches the result for 24h; `force` (the manual button) always
+ *  re-queries. Silent on network failure. */
+export async function fetchLatestVersion(force = false): Promise<LatestCheck> {
+  const cached = force ? undefined : readCachedLatest()
+  if (cached) return cached
+  let result: LatestCheck
+  try {
+    const res = await fetch(`https://raw.githubusercontent.com/${UPDATE_REPO}/master/package.json`, {
+      signal: AbortSignal.timeout(6000),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = (await res.json()) as { version?: unknown }
+    result = {
+      latest: typeof data.version === "string" ? data.version : undefined,
+      checkedAt: Date.now(),
+    }
+  } catch (e) {
+    result = { checkedAt: Date.now(), error: String(e).slice(0, 200) }
+  }
+  try {
+    mkdirSync(configDir(), { recursive: true })
+    writeJsonAtomic(updateCheckPath(), result)
+  } catch {
+    // cache write is best-effort
+  }
+  return result
+}
+
+export interface UpdateStep {
+  command: string
+  ok: boolean
+  output: string
+}
+
+export interface UpdateResult {
+  ok: boolean
+  steps: UpdateStep[]
+  logPath: string
+  error?: string
+}
+
+/** Run `git pull --ff-only` + `install.sh --yes` from the recorded source
+ *  clone. User-triggered only — never called automatically. The log file is
+ *  written on every path, including aborts. */
+export async function runUpdate(sourceRoot: string, logPath: string): Promise<UpdateResult> {
+  const steps: UpdateStep[] = []
+  const finish = (ok: boolean, error?: string): UpdateResult => {
+    try {
+      mkdirSync(dirname(logPath), { recursive: true })
+      writeFileSync(
+        logPath,
+        steps.map((s) => `$ ${s.command} (exit ${s.ok ? 0 : 1})\n${s.output}`).join("\n\n---\n\n") + "\n",
+      )
+    } catch {
+      // log write is best-effort
+    }
+    return { ok, steps, logPath, error }
+  }
+  if (!sourceRoot || !existsSync(join(sourceRoot, "install.sh"))) {
+    return finish(
+      false,
+      `no install.sh at ${sourceRoot || "(no source clone recorded)"} — reinstall with ./install.sh from the source directory`,
+    )
+  }
+  const { spawn } = await import("node:child_process")
+  const runStep = (display: string, command: string, args: string[]): Promise<UpdateStep> =>
+    new Promise((resolve) => {
+      let output = ""
+      try {
+        const child = spawn(command, args, { cwd: sourceRoot })
+        child.stdout?.on("data", (d: Buffer) => (output += String(d)))
+        child.stderr?.on("data", (d: Buffer) => (output += String(d)))
+        child.on("error", (e) => resolve({ command: display, ok: false, output: output + String(e) }))
+        child.on("close", (code) => resolve({ command: display, ok: code === 0, output }))
+      } catch (e) {
+        resolve({ command: display, ok: false, output: String(e) })
+      }
+    })
+  // The recorded source must be a git clone — abort with a clear message
+  // instead of reinstalling from an unknown tree.
+  const probe = await runStep(`git -C ${sourceRoot} rev-parse --is-inside-work-tree`, "git", [
+    "-C",
+    sourceRoot,
+    "rev-parse",
+    "--is-inside-work-tree",
+  ])
+  steps.push(probe)
+  if (!probe.ok) {
+    return finish(
+      false,
+      `the recorded source (${sourceRoot}) is not a git clone — reinstall with ./install.sh from the source directory`,
+    )
+  }
+  const pull = await runStep(`git -C ${sourceRoot} pull --ff-only`, "git", ["-C", sourceRoot, "pull", "--ff-only"])
+  steps.push(pull)
+  if (!pull.ok) {
+    // A failed pull means the new version was not fetched — do not reinstall
+    // from the stale tree.
+    return finish(false, `git pull --ff-only failed — the source clone was not updated (see ${logPath})`)
+  }
+  const install = await runStep(`bash ${join(sourceRoot, "install.sh")} --yes`, "bash", [
+    join(sourceRoot, "install.sh"),
+    "--yes",
+  ])
+  steps.push(install)
+  return finish(install.ok, install.ok ? undefined : `install.sh failed (see ${logPath})`)
+}
+
+/** Refresh agent definitions that this plugin wrote and that are unchanged
+ *  since (hash match). User-edited files are kept unless `force` is set (then
+ *  they are backed up to `<file>.bak` before being overwritten). */
+export function refreshAgentDefinitions(
+  dir: string,
+  options?: { roots?: string[]; force?: boolean },
+): { updated: string[]; kept: string[]; backedUp: string[] } {
+  const updated: string[] = []
+  const kept: string[] = []
+  const backedUp: string[] = []
+  const searchRoots = options?.roots && options.roots.length ? options.roots : templateRoots()
+  const marker = readAgentMarker(dir) ?? { version: pluginVersion(), writtenAt: "", hashes: {} }
+  const next: AgentMarker = { version: pluginVersion(), writtenAt: new Date().toISOString(), hashes: {} }
+  for (const name of ALL_AGENT_NAMES) {
+    const dest = join(dir, `${name}.md`)
+    let template: string | undefined
+    for (const root of searchRoots) {
+      const src = join(root, "agents-v2", `${name}.md`)
+      if (existsSync(src)) {
+        try {
+          template = readFileSync(src, "utf8")
+        } catch {
+          template = undefined
+        }
+        if (template !== undefined) break
+      }
+    }
+    if (template === undefined) continue
+    let current: string | undefined
+    try {
+      current = readFileSync(dest, "utf8")
+    } catch {
+      current = undefined
+    }
+    if (current === undefined) {
+      try {
+        writeFileSync(dest, template)
+        next.hashes[name] = sha256(template)
+        updated.push(name)
+      } catch {
+        // read-only — skip
+      }
+      continue
+    }
+    const known = marker.hashes[name]
+    if (current === template || (known && sha256(current) === known)) {
+      try {
+        writeFileSync(dest, template)
+        next.hashes[name] = sha256(template)
+        updated.push(name)
+      } catch {
+        // read-only — skip
+      }
+    } else {
+      // User-edited (or legacy/unknown): keep it and do NOT record its hash —
+      // the next refresh must still see it as not-ours. `force` (an explicit
+      // confirmation in the UI) overwrites it after a .bak backup.
+      if (options?.force) {
+        try {
+          writeFileSync(`${dest}.bak`, current)
+          writeFileSync(dest, template)
+          next.hashes[name] = sha256(template)
+          updated.push(name)
+          backedUp.push(name)
+        } catch {
+          kept.push(name)
+        }
+      } else {
+        kept.push(name)
+      }
+    }
+  }
+  flushAgentMarker(dir, next)
+  return { updated, kept, backedUp }
 }
 
 export function setAgentModel(repo: string, agent: PlannerAgent, model: string): void {
@@ -231,6 +761,14 @@ export function setMaxParallel(repo: string, value: number): number {
   cfg.maxParallelSubagents = normalizeMaxParallel(value, cfg.maxParallelSubagents)
   writePlannerConfig(repo, cfg)
   return cfg.maxParallelSubagents
+}
+
+/** Toggle the delegation watchdog. */
+export function setEnforceDelegation(repo: string, enabled: boolean): boolean {
+  const cfg = readPlannerConfig(repo)
+  cfg.enforceDelegation = enabled
+  writePlannerConfig(repo, cfg)
+  return cfg.enforceDelegation
 }
 
 export function setVisionEnabled(repo: string, enabled: boolean): void {
@@ -336,49 +874,87 @@ function templateRoots(): string[] {
   return roots
 }
 
-/** Install the bundled V2 agent definitions into `<repo>/.opencode/agents/`.
- *  Only MISSING files are written — user edits are never overwritten.
- *  Returns warnings for templates that could not be found anywhere. */
-export function ensureAgentFiles(repo: string): string[] {
-  const warnings: string[] = []
-  // The brainstormer writes its spec here; the file tool does not create
-  // parent directories, so make sure the directory exists up front.
+/** The brainstormer writes its spec here; the file tool never creates parent
+ *  directories, so the plugin guarantees the directory exists. */
+export function ensureSpecsDir(repo: string): void {
   try {
     mkdirSync(join(repo, "docs", "superpowers", "specs"), { recursive: true })
   } catch {
-    // read-only project: the agent reports it instead
+    // read-only project — the brainstormer reports the failure instead
   }
-  const dir = join(repo, ".opencode", "agents")
+}
+
+/** Install the bundled V2 agent definitions into `<repo>/.opencode/agents/`.
+ *  Only MISSING files are written — user edits are never overwritten. Also
+ *  records a marker with per-file hashes so the update flow can later refresh
+ *  files this plugin wrote while keeping user edits.
+ *
+ *  NOTE: this deliberately does NOT create `docs/superpowers/specs/` — that
+ *  directory belongs to brainstormer runs and is created at delegation time
+ *  (the execute.before hook), never on mere plugin load. A project that never
+ *  uses the planner must not grow plugin directories. */
+export function ensureAgentFiles(repo: string): string[] {
+  const warnings: string[] = []
+  const dir = projectAgentsDir(repo)
   try {
     mkdirSync(dir, { recursive: true })
   } catch {
     return ["could not create .opencode/agents"]
   }
   const roots = templateRoots()
+  const marker = readAgentMarker(dir) ?? { version: pluginVersion(), writtenAt: "", hashes: {} }
+  const next: AgentMarker = { version: pluginVersion(), writtenAt: new Date().toISOString(), hashes: { ...marker.hashes } }
   for (const name of ALL_AGENT_NAMES) {
     const dest = join(dir, `${name}.md`)
-    if (existsSync(dest)) continue
-    let copied = false
+    let template: string | undefined
     for (const root of roots) {
       const src = join(root, "agents-v2", `${name}.md`)
       if (existsSync(src)) {
         try {
-          copyFileSync(src, dest)
-          copied = true
+          template = readFileSync(src, "utf8")
         } catch {
-          copied = false
+          template = undefined
         }
-        if (copied) break
+        if (template !== undefined) break
       }
     }
-    if (!copied) warnings.push(`agent template not found: agents-v2/${name}.md`)
+    if (template === undefined) {
+      warnings.push(`agent template not found: agents-v2/${name}.md`)
+      continue
+    }
+    let current: string | undefined
+    try {
+      current = readFileSync(dest, "utf8")
+    } catch {
+      current = undefined
+    }
+    if (current === undefined) {
+      try {
+        writeFileSync(dest, template)
+        next.hashes[name] = sha256(template)
+      } catch {
+        warnings.push(`could not write agents/${name}.md`)
+      }
+      continue
+    }
+    // A file identical to the current template is ours — safe to refresh later.
+    if (current === template) next.hashes[name] = sha256(template)
   }
+  flushAgentMarker(dir, next)
   return warnings
 }
 
-/** True when the agent's definition exists in the project (V2 layout). */
+/** True when the agent's definition exists — in the project (V2 layout) or
+ *  globally. The watchdog uses this to decide whether delegation is at all
+ *  possible: a missing PROJECT file must not disable enforcement when the
+ *  global definition is there. */
 export function agentFileExists(repo: string, name: string): boolean {
-  return existsSync(join(repo, ".opencode", "agents", `${name}.md`))
+  if (existsSync(join(repo, ".opencode", "agents", `${name}.md`))) return true
+  try {
+    return existsSync(join(globalAgentsDir(), `${name}.md`))
+  } catch {
+    return false
+  }
 }
 
 /** Per-project screenshot directory (agents save captures here). */

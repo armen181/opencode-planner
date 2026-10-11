@@ -14,9 +14,9 @@ contract:
      disables or enables them.
   5. `/plan` is the only server command; the config file drives the agent
      transforms and edits re-apply live through the watcher.
-  6. The TUI entrypoint: typing /planner offers only /planner-config, which
-     opens the configuration dialog; the vision/parallelism dialogs live in
-     the ctrl+p palette.
+  6. The TUI entrypoint: typing /planner offers /planner-config and
+     /planner-status; the vision/parallelism/status dialogs also live in the
+     ctrl+p palette.
 
 No model provider is needed (no model turns are made).
 Run: python3 tests/e2e/test_planner_v2.py   (set PLANNER_V2_BIN to override)
@@ -82,6 +82,8 @@ def server_env():
     env["XDG_CONFIG_HOME"] = os.path.join(HOME_DIR, ".config")
     env["XDG_DATA_HOME"] = os.path.join(HOME_DIR, ".local", "share")
     env["XDG_CACHE_HOME"] = os.path.join(HOME_DIR, ".cache")
+    # Keep the TUI probes deterministic: no background GitHub check / toasts.
+    env["PLANNER_NO_UPDATE_CHECK"] = "1"
     return env
 
 
@@ -190,6 +192,13 @@ class V2:
         res = self.api("session.create", body={"title": title})
         return ((res or {}).get("data") or {}).get("id")
 
+    def prompt_async(self, sid, text):
+        cmd = [self.binary, "api", "session.prompt", "--server", f"http://127.0.0.1:{PORT}",
+               "--param", f"sessionID={sid}", "-d", json.dumps({"text": text})]
+        env = server_env()
+        env["OPENCODE_PASSWORD"] = self.password
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, cwd=SCRATCH)
+
     def session(self, sid):
         return ((self.api("session.get", {"sessionID": sid}) or {}).get("data") or {})
 
@@ -205,10 +214,11 @@ def strip_ansi(text):
 def tui_dialog_probe(binary):
     """Boot the TUI over a PTY and verify the planner surface:
 
-    1. Typing `/planner` offers only /planner-config (no /planner-vision,
-       /planner-status or /planner-help, each exactly once).
+    1. Typing `/planner` offers /planner-config and /planner-status (no
+       /planner-vision or /planner-help, each exactly once).
     2. `/planner-config` opens the configuration dialog.
-    3. ctrl+p (command palette) still lists the vision/parallelism dialogs.
+    3. `/planner-status` opens the status/update dialog.
+    4. ctrl+p (command palette) still lists the vision/parallelism dialogs.
     """
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
@@ -242,8 +252,8 @@ def tui_dialog_probe(binary):
         completion = strip_ansi(drain(2)).lower()
         slash_ok = (
             completion.count("planner-config") == 1
+            and completion.count("planner-status") == 1
             and "planner-vision" not in completion
-            and "planner-status" not in completion
             and "planner-help" not in completion
         )
 
@@ -267,6 +277,17 @@ def tui_dialog_probe(binary):
         os.write(master, b"\x1b")
         time.sleep(0.6)
         drain(1)
+        os.write(master, b"/planner-status")
+        time.sleep(1.5)
+        drain(1)
+        os.write(master, b"\r")
+        time.sleep(1.5)
+        status_out = strip_ansi(drain(6)).lower()
+        status_ok = "planner status" in status_out or ("running v" in status_out and "check for updates" in status_out)
+
+        os.write(master, b"\x1b")
+        time.sleep(0.6)
+        drain(1)
         os.write(master, b"\x10")  # ctrl+p: command palette
         time.sleep(2)
         palette = strip_ansi(drain(3)).lower()
@@ -274,7 +295,7 @@ def tui_dialog_probe(binary):
         os.write(master, b"\x1b")
         time.sleep(0.4)
         drain(1)
-        return slash_ok, dialog_ok, palette_ok
+        return slash_ok, dialog_ok, status_ok, palette_ok
     finally:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -422,8 +443,8 @@ def main():
         check("agent definitions installed to .opencode/agents",
               all(os.path.exists(os.path.join(SCRATCH, ".opencode", "agents", f"{a}.md"))
                   for a in ("planner", "brainstormer", "worker", "tester", "vision")))
-        check("specs directory created for the brainstormer",
-              os.path.isdir(os.path.join(SCRATCH, "docs", "superpowers", "specs")))
+        check("no docs/superpowers/specs before any planner use (opt-in, lazy)",
+              not os.path.exists(os.path.join(SCRATCH, "docs", "superpowers", "specs")))
         with open(os.path.join(SCRATCH, ".opencode", "agents", "planner.md")) as f:
             planner_md = f.read()
         check("planner.md is the V2 format", "permissions:" in planner_md and "mode: primary" in planner_md)
@@ -434,6 +455,36 @@ def main():
         info = api.session(sid)
         check("new session is not on planner", info.get("agent") != "planner",
               f"agent={info.get('agent')!r}")
+
+        print("\n[Phase 4b] First planner use creates the project snapshot (R3)")
+        defaults_path = os.path.join(HOME_DIR, ".config", "opencode", "planner-defaults.json")
+        check("global defaults file created on plugin load", os.path.exists(defaults_path))
+        cfg_path = os.path.join(SCRATCH, ".opencode", "planner-plugin.json")
+        check("no project config before planner use", not os.path.exists(cfg_path))
+        snap_sid = api.create_session("snapshot")
+        api.api("session.switchAgent", {"sessionID": snap_sid}, body={"agent": "planner"})
+        api.api("session.switchModel", {"sessionID": snap_sid},
+                body={"model": {"providerID": DEMO_PROVIDER, "id": "worker-model"}})
+        api.prompt_async(snap_sid, "snapshot probe (no model needed)")
+        created = False
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            if os.path.exists(cfg_path):
+                created = True
+                break
+            time.sleep(1)
+        check("first planner use materialized the project config", created)
+        if created:
+            snap = json.load(open(cfg_path))
+            check("snapshot stamps plannerVersion/source/createdAt",
+                  bool(snap.get("plannerVersion")) and snap.get("source") == "defaults" and bool(snap.get("createdAt")),
+                  f"keys={sorted(snap)[:8]}")
+            defs = json.load(open(defaults_path)) if os.path.exists(defaults_path) else {}
+            check("snapshot settings match the current defaults",
+                  snap.get("maxCycles") == defs.get("maxCycles")
+                  and snap.get("maxParallelSubagents") == defs.get("maxParallelSubagents"))
+            os.remove(cfg_path)
+            check("snapshot removed again so later phases start clean", not os.path.exists(cfg_path))
 
         print("\n[Phase 5] Server commands + config file drives the transforms")
         cmds = api.commands()
@@ -511,14 +562,15 @@ def main():
         check("plugin does not force-disable MCP servers", (mcp.get(MCP_SERVER) or {}).get("status") != "disabled",
               f"status={mcp.get(MCP_SERVER)!r}")
 
-        print("\n[Phase 7] TUI: /planner-config opens the dialog, palette intact")
+        print("\n[Phase 7] TUI: /planner-config + /planner-status dialogs, palette intact")
         try:
-            slash_ok, dialog_ok, palette_ok = tui_dialog_probe(binary)
+            slash_ok, dialog_ok, status_ok, palette_ok = tui_dialog_probe(binary)
         except Exception as e:
             print(f"    (TUI probe error: {e})")
-            slash_ok = dialog_ok = palette_ok = False
-        check("slash offers only planner-config (no vision/status/help)", slash_ok)
+            slash_ok = dialog_ok = status_ok = palette_ok = False
+        check("slash offers planner-config + planner-status (no vision/help)", slash_ok)
         check("/planner-config opens the configuration dialog", dialog_ok)
+        check("/planner-status opens the version/update dialog", status_ok)
         check("command palette still lists the vision/parallelism dialogs", palette_ok)
 
         return finish(server, logf)
